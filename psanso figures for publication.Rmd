@@ -1,0 +1,754 @@
+---
+title: "Phytophthora sansomeana host range in Michigan field crops"
+author: "Austin McCoy"
+date: "4/25/2023"
+output: html_document
+---
+
+Packages needed for analysis
+```{r, eval=TRUE}
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+library(bestNormalize)
+library(nlme)
+library(car)
+library(lsmeans)
+library(reshape)
+
+```
+
+
+Loading in the host phenotyping data
+```{r}
+host_phenotype <- read_excel("L:/!Phytophthora sansomeana host range characterization/Host data sheets/combined host information/combined runs.xlsx")
+
+```
+
+Loading in the determined EC50 values
+```{r}
+psan_ec50 <- read_excel("L:/!Phytophthora sansomeana host range characterization/Fungicide sensitivity data/Final data for publication/psanso.r1andr2combined.gooddata.xlsx")
+
+```
+
+Loading in the root qPCR data for P. sansomeana
+```{r}
+samples_1_42 <- read_excel("L:/!Phytophthora sansomeana host range characterization/P, sansomeana host range qPCR data/Samples 1 - 252 standardized baseline/samples 1-42 psanso host root dna-  Quantification Summary.xlsx")
+
+samples_43_84 <- read_excel("L:/!Phytophthora sansomeana host range characterization/P, sansomeana host range qPCR data/Samples 1 - 252 standardized baseline/samples 43-84 psanso host root dna  - Quantification Summary.xlsx")
+
+samples_85_126 <- read_excel("L:/!Phytophthora sansomeana host range characterization/P, sansomeana host range qPCR data/Samples 1 - 252 standardized baseline/samples 85-126 psanso host root dna -  Quantification Summary.xlsx")
+
+samples_127_168 <- read_excel("L:/!Phytophthora sansomeana host range characterization/P, sansomeana host range qPCR data/Samples 1 - 252 standardized baseline/samples 127-168 psanso host root dna -  Quantification Summary.xlsx")
+
+samples_169_210 <- read_excel("L:/!Phytophthora sansomeana host range characterization/P, sansomeana host range qPCR data/Samples 1 - 252 standardized baseline/samples 169-210 psanso host root dna -  Quantification Summary.xlsx")
+
+samples_211_252 <- read_excel("L:/!Phytophthora sansomeana host range characterization/P, sansomeana host range qPCR data/Samples 1 - 252 standardized baseline/samples 211-252 psanso host root dna -  Quantification Summary.xlsx")
+  
+metadata_dnaconc_samples <-  read_excel("L:/!Phytophthora sansomeana host range characterization/P, sansomeana host range qPCR data/File with all qPCR data together/All sansomeana qPCR data standardized baseline.xlsx") 
+
+first_redos <- read_excel("L:/!Phytophthora sansomeana host range characterization/P, sansomeana host range qPCR data/Samples 1 - 252 standardized baseline/psanso randoms redos host range root dna -  Quantification Summary.xlsx")
+  
+second_redos <- read_excel("L:/!Phytophthora sansomeana host range characterization/P, sansomeana host range qPCR data/Samples 1 - 252 standardized baseline/psanso rerun of 8 samples -  Quantification Summary.xlsx")
+
+phenotypic_data <- read_excel("L:/!Phytophthora sansomeana host range characterization/Host data sheets/combined host information/combined runs.xlsx")
+  
+```
+
+concatenating sample files and adding isolate metadata/DNA concentration, cleaning up dataset
+```{r}
+samples_1_252 <- rbind(samples_1_42, samples_43_84, samples_85_126, samples_127_168, samples_169_210, samples_211_252)
+
+samples_1_252_noredos <- samples_1_252[ !(samples_1_252$Sample %in% c(126, 183, 191, 106, 139, 176, 96, 190, 59, 78, 79, 211, 212, 213, 235, 242, 245, 137)), ]
+
+samples_1_252_redonedata <- rbind(samples_1_252_noredos, first_redos, second_redos)
+
+sample_1_252_wmetadata <- merge(samples_1_252_redonedata, metadata_dnaconc_samples, by.x = c("Sample"), by.y = c("Tube"), all=F)
+
+sample_1_252_wmetadata_org <- sample_1_252_wmetadata %>%
+                        subset(., Fluor != "HEX") %>% # removing HEX flurophore as it is P. sojae specific and this is P.sansomeana. HEX Fluor not included in reaction
+                        subset(., select = -c(Target,Content, Well, SQ)) %>% # removing empty and unneeded columns from dataset
+                        relocate(Sample, Host, Isolate, Growth_chamber_Rep, qpcr_rep, total_DNA_input, ngul_DNA_input, Fluor, Cq) # reordering columns to it is easier to find thing visually/logically
+  
+sample_1_252_wmetadata_org$Isolate[sample_1_252_wmetadata_org$Isolate == 'ILSO 3-48C'] <- 'Py. irregulare'
+
+sample_1_252_wmetadata_org$Isolate[sample_1_252_wmetadata_org$Isolate == 'VAL 1602-84'] <- 'VAL1602-84'
+
+sample_1_252_wmetadata_org$Host <- tolower(sample_1_252_wmetadata_org$Host)
+
+#write.xlsx(sample_1_252_wmetadata_org, "all samples qPCR data and meta-data.xlsx")
+
+
+```
+
+## qPCR Data processing and preparation ##
+Standard curve and linear regression for starting DNA concentration of target
+using the below linear regression we will add a column to the dataset with the determined target DNA quantity for each sample/rep
+```{r}
+# y=mx + b, so: y=-3.525x + 37.225
+
+qpcr_eff <- -1+10^(-1/-3.5253)
+qpcr_eff # 92% efficiency
+
+psanso_quantification_fg <- sample_1_252_wmetadata_org %>%
+                          subset(., Fluor == "Quasar 670") %>%
+                          subset(., Sample != "77") %>%
+                          mutate(log_fg_sq_std = ((Cq-37.225)/-3.525), # linear regression identified in excel using fg and not ng for conc
+                                 fgul_sq_std = (10^((Cq-37.225)/-3.525))/2, # solving for qantity (in femptograms) using the Cq value
+                                 fgul_target_ngul_dnaadded_ratio = fgul_sq_std/ngul_DNA_input)
+
+host_summary_qpcr <- psanso_quantification_fg %>%
+  subset(., !Isolate %in% c("No millet", "Py. irregulare", "autoclaved millet")) %>%
+  group_by(Host) %>%
+  summarize(mean_ratio=mean(fgul_target_ngul_dnaadded_ratio, na.rm=TRUE))
+
+# renaming the qPCR hosts so they are the same as other figures. Can be used in the future to reduce or change the names of each host (common name, scientific name, variety, etc)
+host_phenotype
+host_names_all <- list(unique(host_phenotype$Host))
+host_names_minimal <- list(unique(psanso_quantification_fg$Host))
+
+psanso_quantification_fg$Host <- str_replace_all(psanso_quantification_fg$Host, c("soybean"="Soybean (Sloan)", "oats"="Oats (IDA)", "winter_rye"="Winter Rye (Wheeler)", "wheat"="Wheat (Red Dragon)", "drybean"="Drybean (Red Hawk)", "corn"="Corn (DK52-84)"))
+
+psanso_quantification_fg
+
+```
+
+
+Quick summary of Cq values for each rep
+```{r}
+cq_summary <- psanso_quantification_fg %>%
+                group_by(Host, Isolate, Fluor) %>%
+                summarize(cq_mean= mean(Cq),
+                          cq_std= sd(Cq),
+                          DNA_input_mean= mean(total_DNA_input),
+                          DNA_input_sd= sd(total_DNA_input),
+                          fgul_target_ngul_dnaadded_ratio_mean = mean(fgul_target_ngul_dnaadded_ratio), # this is all in "per ul added"
+                          fgul_target_ngul_dnaadded_ratio_sd = sd(fgul_target_ngul_dnaadded_ratio))
+
+```
+
+Normality tests, transformation qPCR data
+```{r}
+
+
+ON_qPCR_data <- psanso_quantification_fg[, -6:-12] # new dataset for Ordered Normal distribution (ON), removing the non-normalized data from the new dataset
+
+# bestNormalize to choose best transformation. P-value divided by df that is closer to 1 means a more normal distribution (a value of 1 would denote a completely normal distribution)
+(BNobject1_qpcr <- bestNormalize(psanso_quantification_fg$fgul_sq_std)) #order norm best
+(BNobject2_qpcr <- bestNormalize(psanso_quantification_fg$ngul_DNA_input)) #square root best
+(BNobject3_qpcr <- bestNormalize(psanso_quantification_fg$fgul_target_ngul_dnaadded_ratio)) # ordernorm best. Since this is the value we are going to be looking at (normalized to ngul_DNA_input (DNA added))
+
+# Adding our normalized data (fgul_target_ngul_dnaadded_ratio) back to the dataframe containing Isolate, Host, Rep, and Run information
+ON_qPCR_data$fgul_target_ngul_dnaadded_ratio <- BNobject3_qpcr$x.t
+
+
+ON_qPCR_data # now everything has been ordered quartile transformed and should fit a normal distribution. Lets double check that now. We transformed everything together here since we are making comparisons across host species by isolate.
+
+
+# Histograms showing each response values distribution - normalized
+png("qPCR disributions before and after normalization.png")
+par(mfrow = c(1,2))
+MASS::truehist(psanso_quantification_fg$fgul_target_ngul_dnaadded_ratio, main="Raw data", nbins=100)
+MASS::truehist(ON_qPCR_data$fgul_target_ngul_dnaadded_ratio, main="Ordered Quartile Norm.", nbins=100)
+dev.off()
+# other than disease severity, everything is looking normally distributed now. 
+
+```
+
+ANOVA and analysis of qPCR data by Host. Looking at potential reservoir hosts here. Figure will be faceted by host, showing mean and sd of each host quantification (boxplot) overall, with significance letters overlaid. Weve already shown phenotypic data for disease and significance there. So, lets focus broadly with the qPCR data.
+```{r}
+ON_qPCR_data_noctrl <- ON_qPCR_data %>%
+  subset(., !Isolate %in% c("No millet", "Py. irregulare", "autoclaved millet")) # removing these controls so they do not skew qPCR data analysis
+
+fit1_qpcr <- aov(fgul_target_ngul_dnaadded_ratio ~ Host, data=ON_qPCR_data_noctrl)
+summary(fit1_qpcr, adjust="bon")
+
+plot(fit1_qpcr) 
+
+hist(fit1_qpcr$residuals) # residuals normally distributed
+
+fit2_qpcr <- aov(fgul_target_ngul_dnaadded_ratio ~ Host + (1|Growth_chamber_Rep), data=ON_qPCR_data)
+summary(fit2_qpcr, adjust="bon") # this looks to be the better model to use for this
+
+fit3_qpcr <- aov(fgul_target_ngul_dnaadded_ratio ~ Isolate*Host + (1|Growth_chamber_Rep) + (1|as.numeric(qpcr_rep)), data=ON_qPCR_data)
+summary(fit3_qpcr, adjust="bon")
+
+anova(fit2_qpcr, fit3_qpcr)
+
+library(lme4)
+
+fit2_lm <- lmer(fgul_target_ngul_dnaadded_ratio ~ Host + (1|Growth_chamber_Rep), data=ON_qPCR_data, na.action = na.omit)
+summary(fit2_lm)
+
+plot(fit2_lm) 
+
+lsmeans_qpcr <- lsmeans(fit2_lm, "Host")
+
+plot(lsmeans_qpcr)
+
+# contrasts for model 2 (better model)
+library(multcomp)
+qpcr_fit2_con <- cld(lsmeans_qpcr, alpha = 0.05, adjust = "bon", Letters = letters, reversed = TRUE)
+results_qpcr_fit2 <- as.data.frame(qpcr_fit2_con)
+
+results_qpcr_fit2 # stat results on host colonization differences, no controls (millet, no millet, py. irregulare) within data
+
+#write.xlsx(results_qpcr_fit2, "qPCr host significance lsmean, se, df, CI.xlsx")
+```
+
+Normality tests, transformation
+```{r}
+host_phenotype
+
+ON_host_phenotype <- host_phenotype # new dataset for Ordered Normal distribution (ON)
+
+ON_host_phenotype <- ON_host_phenotype[, -6:-18] # removing the non-normalized data from the dataset
+
+# bestNormalize to choose best transformation. P-value divided by df that is closer to 1 means a more normal distribution (a value of 1 would denote a completely normal distribution)
+(BNobject1 <- bestNormalize(host_phenotype$Disease_severity)) #ordernorm best
+(BNobject2 <- bestNormalize(host_phenotype$rootweightperplant)) #ordernorm best
+(BNobject3 <- bestNormalize(host_phenotype$shootweightperplant)) #ordernorm best
+(BNobject4 <- bestNormalize(host_phenotype$totalweightperplant)) #ordernorm best
+(BNobject5 <- bestNormalize(host_phenotype$Dry_root_weight)) #ordernorm best
+(BNobject6 <- bestNormalize(host_phenotype$Dry_shoot_weight)) #ordernorm best
+
+# Adding our normalized data back to the dataframe containing Isolate, Host, Rep, and Run information
+ON_host_phenotype$Disease_severity <- BNobject1$x.t
+ON_host_phenotype$rootweightperplant <- BNobject2$x.t
+ON_host_phenotype$shootweightperplant <- BNobject3$x.t
+ON_host_phenotype$totalweightperplant <- BNobject4$x.t
+ON_host_phenotype$Dry_root_weight <- BNobject5$x.t
+ON_host_phenotype$Dry_shoot_weight <- BNobject6$x.t
+
+ON_host_phenotype # now everything has been ordered quartile transformed and should fit a normal distribution. Lets double check that now. We transformed everything together here since we are making comparisons across host species by isolate.
+
+
+# Histograms showing each response values distribution - normalized
+png("disributions before and after normalization.png")
+par(mfrow = c(4,3))
+MASS::truehist(host_phenotype$Disease_severity, main="Raw data", nbins=100)
+MASS::truehist(host_phenotype$rootweightperplant, main="Raw data", nbins=100)
+MASS::truehist(host_phenotype$shootweightperplant, main="Raw data", nbins=100)
+MASS::truehist(host_phenotype$totalweightperplant, main="Raw data", nbins=100)
+MASS::truehist(host_phenotype$Dry_root_weight, main="Raw data", nbins=100)
+MASS::truehist(host_phenotype$Dry_shoot_weight, main="Raw data", nbins=100)
+MASS::truehist(ON_host_phenotype$Disease_severity, main="Ordered Quartile Norm.", nbins=100)
+MASS::truehist(ON_host_phenotype$rootweightperplant, main="Ordered Quartile Norm.", nbins=100)
+MASS::truehist(ON_host_phenotype$shootweightperplant, main="Ordered Quartile Norm.", nbins=100)
+MASS::truehist(ON_host_phenotype$totalweightperplant, main="Ordered Quartile Norm.", nbins=100)
+MASS::truehist(ON_host_phenotype$Dry_root_weight, main="Ordered Quartile Norm.", nbins=100)
+MASS::truehist(ON_host_phenotype$Dry_shoot_weight, main="Ordered Quartile Norm.", nbins=100)
+dev.off()
+# other than disease severity, everything is looking normally distributed now. 
+
+```
+
+MANOVA of response variables, univariate analysis of variables
+```{r}
+fit <- manova(cbind(rootweightperplant, shootweightperplant, totalweightperplant)~Isolate*Host, data=ON_host_phenotype)
+summary(fit, test=c("Pillai"))
+summary(fit, test=c("Wilks"))
+summary(fit, test=c("Hotelling-Lawley"))
+
+
+# this doesn't like Disease severity, likely because it is far from normal distribution even with normalization...
+fit1 <- lme(cbind(rootweightperplant, shootweightperplant, totalweightperplant) ~ Isolate*Host, random = ~1|Run, data=ON_host_phenotype, na.action = na.omit) # best fitting model for our data
+
+fit2 <- lme(cbind(rootweightperplant, shootweightperplant, totalweightperplant) ~ Isolate*Host, random = ~1|Rep, data=ON_host_phenotype, na.action = na.omit)
+
+fit3 <- lme(cbind(rootweightperplant, shootweightperplant, totalweightperplant) ~ Isolate*Host, random= ~1|Run/Rep, data=ON_host_phenotype, na.action = na.omit)
+
+anova(fit1, fit2, fit3)
+
+# correlation of dependent variables
+scatterplotMatrix(~ rootweightperplant + shootweightperplant + totalweightperplant, data = ON_host_phenotype)
+
+cor.test(ON_host_phenotype$rootweightperplant, ON_host_phenotype$shootweightperplant, method="pearson") # 0.663 correlation value, significant p-value (p <2.2e-16) 
+
+cor.test(ON_host_phenotype$rootweightperplant, ON_host_phenotype$totalweightperplant, method="pearson") # not really useful as we would expect this
+cor.test(ON_host_phenotype$shootweightperplant, ON_host_phenotype$totalweightperplant, method="pearson") # not really useful as we would expect this. rootweightperolant and shootweightperplant are both functions of the totalweightperplant column, we expect them to correlate.
+
+
+plot(fit1) # residuals looking pretty random, which is good
+# variance
+VarCorr(fit1)
+
+# confidence intervals
+fit1.ci <- intervals(fit1)
+
+fit1.ci.2 <- as.data.frame(fit1.ci[[1]]) %>% 
+  add_rownames(var = "Isolate") %>% 
+  arrange(est.)
+
+fit1.ci.ggplot <- ggplot(fit1.ci.2, aes(x = reorder(Isolate, est., mean), 
+                 y = est., ymin = lower, ymax = upper)) + 
+                geom_errorbar() + geom_point() + coord_flip() + theme_bw()
+
+#ggsave("confidence intervals for isolate and host interactions.png", plot=fit1.ci.ggplot, width = 16, height = 12, units = "in")
+
+# Contrasts
+fit1.rtwtpp.lsmean <- lsmeans(fit1, "Isolate","Host", var="rootweightperplant")
+fit1.shtwtpp.lsmean <- lsmeans(fit1, "Isolate","Host", var="shootweightperplant")
+fit1.ttlwtpp.lsmean <- lsmeans(fit1, "Isolate","Host", var="totalweightperplant")
+
+fit1.all.lsmeans <- lsmeans(fit1, "Isolate","Host")
+plot(fit1.all.lsmeans)
+fit1.c <- contrast(fit1.all.lsmeans, "trt.vs.ctrl", ref=13, adjust="bon")
+fit1.cdf <- as.data.frame(summary(fit1.c))
+
+### Univariate Analysis
+# root weight per plant
+fit.rtwtpp <- lme(rootweightperplant ~ Isolate*Host, random = ~1|Run, data=ON_host_phenotype, na.action = na.omit)
+fit.rtwtpp.lsmean <- lsmeans(fit.rtwtpp, "Isolate", "Host")
+fit.rtwtpp.c <- contrast(fit.rtwtpp.lsmean, "trt.vs.ctrl", ref=13, adjust="bon")
+rtwtpp.cdf <- as.data.frame(summary(fit.rtwtpp.c))
+# shoot weight per plant
+fit.shtwtpp <- lme(shootweightperplant ~ Isolate*Host, random = ~1|Run, data=ON_host_phenotype, na.action = na.omit)
+fit.shtwtpp.lsmean <- lsmeans(fit.shtwtpp, "Isolate", "Host")
+fit.shtwtpp.c <- contrast(fit.shtwtpp.lsmean, "trt.vs.ctrl", ref=13, adjust="bon")
+shtwtpp.cdf <- as.data.frame(summary(fit.shtwtpp.c))
+# total weight per plant
+fit.ttlwtpp <- lme(totalweightperplant ~ Isolate*Host, random = ~1|Run, data=ON_host_phenotype, na.action = na.omit)
+fit.ttlwtpp.lsmean <- lsmeans(fit.ttlwtpp, "Isolate", "Host")
+fit.ttlwtpp.c <- contrast(fit.ttlwtpp.lsmean, "trt.vs.ctrl", ref=13, adjust="bon")
+ttlwtpp.cdf <- as.data.frame(summary(fit.ttlwtpp.c))
+
+# Bringing the statistical data together
+
+univar.t1 <- full_join(rtwtpp.cdf, shtwtpp.cdf, by=c('contrast', 'Host')) %>%
+  dplyr::select(c(contrast, Host, contains("p.value"))) %>%
+  dplyr::rename(rtwtpp.p=p.value.x, shtwtpp.p=p.value.y)
+
+univar.t2 <- full_join(univar.t1, ttlwtpp.cdf, by=c('contrast', 'Host')) %>%
+  dplyr::select(c(contrast, Host, rtwtpp.p, shtwtpp.p, p.value)) %>%
+  dplyr::rename(ttlwtpp.p=p.value)
+
+univar.all <- full_join(univar.t2, fit1.cdf, by=c('contrast', 'Host')) %>%
+  dplyr::select(c(contrast, Host, rtwtpp.p, shtwtpp.p, ttlwtpp.p, p.value)) %>%
+  dplyr::rename(manova.p=p.value)
+
+univar.all <- cbind(colsplit(univar.all$contrast," - ", names=c('Isolate', 'contrast')), univar.all[2:6])
+
+univar.all$Isolate <- gsub(pattern="\\(", replacement = "", x=univar.all$Isolate)
+univar.all$Isolate <- gsub(pattern="\\)", replacement = "", x=univar.all$Isolate)
+
+
+univar.all # we can use this to now map significance onto the main figures of the manuscript
+
+# combining significance with "host_phenotype" dataset
+host_phenotype
+univar.all
+
+host_phenotype_pval <- full_join(host_phenotype, univar.all, by=c('Isolate','Host')) %>%
+  subset(., select=-c(rt.wt.sig.dif,sh.wt.sig.dif,total.wt.sig.dif,dis.sev.sig.dif,Growth_per_hour_mm))
+
+host_phenotype_pval
+
+#write.xlsx(host_phenotype_pval, "host phenotype with p values.xlsx")
+
+host_phenotype_signif <- host_phenotype_pval
+
+host_phenotype_signif$rtwtpp.p <- ifelse(host_phenotype_signif$rtwtpp.p<0.05, "<0.05", ">0.05")
+host_phenotype_signif$shtwtpp.p <- ifelse(host_phenotype_signif$shtwtpp.p<0.05, "<0.05", ">0.05")
+host_phenotype_signif$ttlwtpp.p <- ifelse(host_phenotype_signif$ttlwtpp.p<0.05, "<0.05", ">0.05")
+host_phenotype_signif
+```
+
+Growth Chamber emergence and germination data
+```{r}
+host_phenotype_signif
+
+level_order_pheno <- c('C-IASO2 6-15', 'C-KSSO2 3-6', 'C-NESO2 5-12', 'C-NESO2 5-19', 'C-NESO2 5-5', 'KSSO 6-1', 'MICO 3-15', 'MICO 3-24', 'MICO 3-28', 'MPS17_22', 'MPS17_24', 'ONSO2 1-114', 'V-KSSO2 1-7', 'V-KSSO2 3-6', 'V-NESO2 5-44', 'V-NESO2 5-45', 'VAL1602-18', 'VAL1602-84', 'Py. irregulare', 'AUTOCLAVED MILLET', 'NO MILLET' )
+
+germination_plot <- ggplot(host_phenotype_signif, aes(x=factor(Isolate, levels = level_order_pheno), y=Germination)) + 
+  geom_boxplot() +
+  facet_wrap(vars(Host), ncol=1) +
+  theme_gray() +
+  theme(axis.text.x = element_text(size = 10, face = "bold", family = "serif", angle = 45, hjust = 1),
+                     axis.text.y = element_text(size = 10, face = "bold", family = "serif"),
+                     axis.title.x = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.title.y = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.line.x = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     axis.line.y = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     legend.text = element_text(size = 15, face = "bold", family = "serif"),
+                     legend.key = element_blank(),
+                     legend.title = element_text(size = 15, face="bold", family = "serif"),
+                     legend.position = "right",
+                     strip.text.x = element_text(size = 20, face = "bold", family = "serif"),
+                     title = element_text(size = 25, family = "serif")) +
+  ylim(0,7) +
+                    labs(x="Isolate",y="Germination (of 5 )") +
+          ggtitle("Host germination") 
+         
+germination_plot
+
+#ggsave("germination boxplot host by isolate.png", plot=germination_plot, width = 16, height = 12, units = "in")
+
+emergence_plot <- ggplot(host_phenotype_signif, aes(x=factor(Isolate, levels = level_order_pheno), y=Emergence)) + 
+  geom_boxplot() +
+  #geom_violin(scale="width", size=0.1, position = position_dodge(width = 1.0), trim=FALSE) + #position = 'dodge', col = '#4d4d4d'
+  #geom_jitter(shape=16, size=1, position = position_jitter(0.5), alpha=0.5) + 
+  #geom_point(position=position_jitterdodge(jitter.width = 0.1), alpha=0.5) +
+  #(fun = "mean", geom="crossbar", width= 0.5, colour="black") +
+  #geom_boxplot(width=0.75, position = position_dodge(width = 1.0)) + 
+  #scale_fill_manual(values = c("#99CCFF", "#808080", "#FF9999")) +
+  facet_wrap(vars(Host), ncol=1) +
+  theme_gray() +
+  #geom_hline(yintercept=40, linetype="dashed", color = "red") +
+  #geom_vline(xintercept = c(1.5, 2.5), linetype="solid", color="black") +
+  theme(axis.text.x = element_text(size = 10, face = "bold", family = "serif", angle = 45, hjust = 1),
+                     axis.text.y = element_text(size = 10, face = "bold", family = "serif"),
+                     axis.title.x = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.title.y = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.line.x = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     axis.line.y = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     legend.text = element_text(size = 15, face = "bold", family = "serif"),
+                     legend.key = element_blank(),
+                     legend.title = element_text(size = 15, face="bold", family = "serif"),
+                     legend.position = "right",
+                     strip.text.x = element_text(size = 20, face = "bold", family = "serif"),
+                     title = element_text(size = 25, family = "serif")) +
+  ylim(0,7) +
+                    labs(x="Isolate",y="Emergence") +
+          ggtitle("Host Emergence") 
+         
+emergence_plot
+
+#ggsave("emergence boxplot host by isolate.png", plot=emergence_plot, width = 16, height = 12, units = "in")
+
+mean_sd_germ_emerg <- host_phenotype_signif %>%
+  group_by(Isolate, Host) %>%
+  summarise(mean_germ=mean(Germination, na.rm=TRUE),
+            sd_germ=sd(Germination, na.rm=TRUE),
+            mean_emerg=mean(Emergence, na.rm=TRUE),
+            sd_emerg=sd(Emergence, na.rm=TRUE),
+            n=n())
+
+mean_emergence_per_host <- host_phenotype_signif %>%
+  group_by(Host) %>%
+  subset(., !Isolate %in% c("AUTOCLAVED MILLET", "NO MILLET", "Py. irregulare")) %>%
+  summarise(mean_germ=mean(Germination, na.rm=TRUE),
+            sd_germ=sd(Germination, na.rm=TRUE),
+            mean_emerg=mean(Emergence, na.rm=TRUE),
+            sd_emerg=sd(Emergence, na.rm=TRUE),
+            n=n())
+  
+ hist(host_phenotype_signif$Emergence)
+hist(host_phenotype_signif$Germination)
+
+
+#write.xlsx(mean_sd_germ_emerg, "mean and standard deviation germination and emergence.xlsx")
+
+```
+
+Growth Chamber Disease severity data
+```{r}
+host_phenotype
+
+disease_severity_plot <- ggplot(host_phenotype_signif, aes(x=factor(Isolate, levels = level_order_pheno), y=Disease_severity)) +
+geom_violin(scale="width", size=0.1, position = position_dodge(width = 1.0), trim=FALSE) + 
+  geom_point(position=position_jitter(seed = 1, width=0.2), alpha=0.5) + 
+  stat_summary(fun = "mean", geom="crossbar", width= 0.5, colour="black") +
+  facet_wrap(vars(Host)) +
+  theme_gray() +
+  theme(axis.text.x = element_text(size = 10, face = "bold", family = "serif", angle = 45, hjust = 1),
+                     axis.text.y = element_text(size = 10, face = "bold", family = "serif"),
+                     axis.title.x = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.title.y = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.line.x = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     axis.line.y = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     legend.text = element_text(size = 15, face = "bold", family = "serif"),
+                     legend.key = element_blank(),
+                     legend.title = element_text(size = 15, face="bold", family = "serif"),
+                     legend.position = "right",
+                     strip.text.x = element_text(size = 20, face = "bold", family = "serif"),
+                     title = element_text(size = 25, family = "serif")) +
+                      ylim(0,100) +
+                      ggtitle("Disease Severity") +
+  labs(x="Isolate",y="Disease Severity") 
+
+disease_severity_plot
+
+#ggsave("disease severity violin plot host by isolate.png", plot=disease_severity_plot, width = 16, height = 12, units = "in")
+
+mean_sd_dis_sev <- host_phenotype_signif %>%
+  group_by(Isolate, Host) %>%
+  summarise(mean_dissev=mean(Disease_severity, na.rm=TRUE),
+            sd_dissev=sd(Disease_severity, na.rm=TRUE),
+            n=n())
+
+
+#write.xlsx(mean_sd_dis_sev, "mean and standard deviation disease severity.xlsx")
+
+```
+
+Root (FIgure 1), shoot (Figure 2), and total weight per plant (Figure 3)
+```{r}
+host_phenotype
+
+root_wtperplant_plot <- ggplot(host_phenotype_signif, aes(x=factor(Isolate, levels = level_order_pheno), y=rootweightperplant, fill=rtwtpp.p)) +
+geom_violin(scale="width", size=0.1, position = position_dodge(width = 1.0), trim=TRUE) + 
+  geom_point(position=position_jitter(seed = 1, width=0.2), alpha=0.5) + 
+  stat_summary(fun = "mean", geom="crossbar", width= 0.5, colour="black") +
+  facet_wrap(vars(Host), scales = "free_y") +
+  theme_gray() +
+  theme(axis.text.x = element_text(size = 15, face = "bold", family = "serif", angle = 45, hjust = 1),
+                     axis.text.y = element_text(size = 15, face = "bold", family = "serif"),
+                     axis.title.x = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.title.y = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.line.x = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     axis.line.y = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     legend.text = element_text(size = 15, face = "bold", family = "serif"),
+                     legend.key = element_blank(),
+                     legend.title = element_text(size = 15, face="bold", family = "serif"),
+                     legend.position = "right",
+                     strip.text.x = element_text(size = 20, face = "bold", family = "serif"),
+                     title = element_text(size = 25, family = "serif")) +
+                      #ylim(0,100) +
+                      ggtitle("Root weight per plant (mg)") +
+  labs(x="Isolate",y="Root weight (mg)", fill="p-value") 
+
+root_wtperplant_plot
+
+ggsave("Figure 1 root weight per plant by isolate and host.png", plot=root_wtperplant_plot, width = 16, height = 12, units = "in")
+
+shoot_wtperplant_plot <- ggplot(host_phenotype_signif, aes(x=factor(Isolate, levels = level_order_pheno), y=shootweightperplant, fill=shtwtpp.p)) +
+geom_violin(scale="width", size=0.1, position = position_dodge(width = 1.0), trim=TRUE) + 
+  geom_point(position=position_jitter(seed = 1, width=0.2), alpha=0.5) + 
+  stat_summary(fun = "mean", geom="crossbar", width= 0.5, colour="black") +
+  facet_wrap(vars(Host), scales = "free_y") +
+  theme_gray() +
+  theme(axis.text.x = element_text(size = 15, face = "bold", family = "serif", angle = 45, hjust = 1),
+                     axis.text.y = element_text(size = 15, face = "bold", family = "serif"),
+                     axis.title.x = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.title.y = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.line.x = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     axis.line.y = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     legend.text = element_text(size = 15, face = "bold", family = "serif"),
+                     legend.key = element_blank(),
+                     legend.title = element_text(size = 15, face="bold", family = "serif"),
+                     legend.position = "right",
+                     strip.text.x = element_text(size = 20, face = "bold", family = "serif"),
+                     title = element_text(size = 25, family = "serif")) +
+                      #ylim(0,100) +
+                      ggtitle("Shoot weight per plant (mg)") +
+  labs(x="Isolate",y="Shoot weight (mg)", fill="p-value") 
+
+
+shoot_wtperplant_plot
+
+ggsave("Figure 2 shoot weight per plant isolate and host.png", plot=shoot_wtperplant_plot, width = 16, height = 12, units = "in")
+
+total_wtperplant_plot <- ggplot(host_phenotype_signif, aes(x=factor(Isolate, levels = level_order_pheno), y=totalweightperplant, fill=ttlwtpp.p)) +
+geom_violin(scale="width", size=0.1, position = position_dodge(width = 1.0), trim=TRUE) + 
+  geom_point(position=position_jitter(seed = 1, width=0.2), alpha=0.5) + 
+  stat_summary(fun = "mean", geom="crossbar", width= 0.5, colour="black") +
+  facet_wrap(vars(Host), scales = "free_y") +
+  theme_gray() +
+  theme(axis.text.x = element_text(size = 15, face = "bold", family = "serif", angle = 45, hjust = 1),
+                     axis.text.y = element_text(size = 15, face = "bold", family = "serif"),
+                     axis.title.x = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.title.y = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.line.x = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     axis.line.y = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     legend.text = element_text(size = 15, face = "bold", family = "serif"),
+                     legend.key = element_blank(),
+                     legend.title = element_text(size = 15, face="bold", family = "serif"),
+                     legend.position = "right",
+                     strip.text.x = element_text(size = 20, face = "bold", family = "serif"),
+                     title = element_text(size = 25, family = "serif")) +
+                      #ylim(0,) +
+                      ggtitle("Total weight per plant (mg)") +
+  labs(x="Isolate",y="Total weight (mg)", fill="p-value") 
+
+total_wtperplant_plot
+
+ggsave("Figure 3 total weight per plant isolate and host.png", plot=total_wtperplant_plot, width = 16, height = 12, units = "in")
+
+
+host_range_ttlwt <- host_phenotype_signif %>%
+  group_by(Isolate, Host, ttlwtpp.p) %>%
+  summarise() %>%
+  subset(., ttlwtpp.p != ">0.05")
+
+host_range_ttlwt
+
+ttlwt_sig_heatmap <-  ggplot(host_range_ttlwt, aes(x=factor(Isolate,level=level_order_pheno), y=Host, fill=ttlwtpp.p)) +
+  geom_tile() +
+  theme(axis.text.x = element_text(size = 10, face = "bold", family = "serif", angle = 45, hjust=1),
+    axis.text.y = element_text(size = 10, face = "bold", family = "serif"),
+    axis.title.x = element_text(size = 20, face = "bold", family = "serif"),
+    axis.title.y = element_text(size = 20, face = "bold", family = "serif"),
+    axis.line.x = element_line(colour = 'gray', size=0.5, linetype='solid'),
+    axis.line.y = element_line(colour = 'gray', size=0.5, linetype='solid'),
+    legend.text = element_text(size = 10, face = "bold", family = "serif"),
+    legend.key = element_blank(),
+    legend.title = element_text(size = 10, face="bold", family = "serif"),
+    legend.position = "right",
+    strip.text.x = element_text(size = 15, face = "bold", family = "serif"),
+    title = element_text(size = 10, family = "serif")) +
+  xlab("Isolate") + ylab("Host") +
+      ggtitle("Symptomatic host range")
+
+ttlwt_sig_heatmap
+  
+#ggsave("Symptomatic host range by isolate.png", plot=ttlwt_sig_heatmap, width = 16, height = 12, units = "in")
+
+```
+
+
+
+femptogram target per nanogram total DNA added
+```{r}
+
+
+level_order <- c('C-IASO2 6-15', 'C-KSSO2 3-6', 'C-NESO2 5-12', 'C-NESO2 5-19', 'C-NESO2 5-5', 'KSSO 6-1', 'MICO 3-15', 'MICO 3-24', 'MICO 3-28', 'MPS17_22', 'MPS17_24', 'ONSO2 1-114', 'V-KSSO2 1-7', 'V-KSSO2 3-6', 'V-NESO2 5-44', 'V-NESO2 5-45', 'VAL1602-18', 'VAL1602-84', 'Py. irregulare', 'autoclaved millet', 'No millet' )
+
+psanso_quantification_fg_notrl <- psanso_quantification_fg %>%
+  subset(., !Isolate %in% c("No millet", "Py. irregulare", "autoclaved millet"))
+
+fg_target_and_input_dna_ratio <- ggplot(psanso_quantification_fg_notrl, aes(x=Host, y=fgul_target_ngul_dnaadded_ratio)) +
+geom_boxplot() +
+  scale_y_log10(limits=c(0.1, 100000)) +
+  geom_label(label="b", x=1, y=4, label.size = 0.50, color="black") +
+  geom_label(label="b", x=2, y=4, label.size = 0.50, color="black") +
+  geom_label(label="d", x=3, y=2.4, label.size = 0.50, color="black") +
+  geom_label(label="a", x=4, y=4.2, label.size = 0.50, color="black") +
+  geom_label(label="cd", x=5, y=2, label.size = 0.50, color="black") +
+  geom_label(label="c", x=6, y=2.4, label.size = 0.50, color="black") +
+  theme_gray() +
+  theme(axis.text.x = element_text(size = 15, face = "bold", angle=45, hjust=1, family = "serif"),
+                     axis.text.y = element_text(size = 15, face = "bold", family = "serif"),
+                     axis.title.x = element_text(size = 15, face = "bold", family = "serif"),
+                     axis.title.y = element_text(size = 15, face = "bold", family = "serif"),
+                     axis.line.x = element_line(colour = 'gray', linewidth =0.5, linetype='solid'),
+                     axis.line.y = element_line(colour = 'gray', linewidth=0.5, linetype='solid'),
+                     legend.text = element_text(size = 10, face = "bold", family = "serif"),
+                     legend.key = element_blank(),
+                     legend.title = element_text(size = 10, face="bold", family = "serif"),
+                     legend.position = "right",
+                     strip.text.x = element_text(size = 20, face = "bold", family = "serif"),
+                     title = element_text(size = 16, family = "serif")) +
+                      ggtitle("qPCR quantification - ratio of fg P. sansomeana: total ng DNA added ") +
+  xlab("Plant tested") + ylab("fg P. sansomeana / ng DNA added")
+
+fg_target_and_input_dna_ratio
+
+ggsave("Figure 4 fg P. sansomeana per ng total DNA by host.png", plot=fg_target_and_input_dna_ratio, width = 16, height = 12, units = "in")
+
+fg_target_and_input_dna_ratio_isolate <- ggplot(psanso_quantification_fg_notrl, aes(x=factor(Isolate, levels=level_order),y=fgul_target_ngul_dnaadded_ratio)) +
+geom_boxplot() +
+  scale_y_log10() +
+facet_wrap(vars(Host)) +
+theme_gray() +
+  #geom_hline(yintercept=40, linetype="dashed", color = "red") +
+  theme(axis.text.x = element_text(size = 10, face = "bold", angle=45, hjust=1, family = "serif"),
+                     axis.text.y = element_text(size = 10, face = "bold", family = "serif"),
+                     axis.title.x = element_text(size = 15, face = "bold", family = "serif"),
+                     axis.title.y = element_text(size = 15, face = "bold", family = "serif"),
+                     axis.line.x = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     axis.line.y = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     legend.text = element_text(size = 10, face = "bold", family = "serif"),
+                     legend.key = element_blank(),
+                     legend.title = element_text(size = 10, face="bold", family = "serif"),
+                     legend.position = "right",
+                     strip.text.x = element_text(size = 15, face = "bold", family = "serif"),
+                     title = element_text(size = 16, family = "serif")) +
+                      ggtitle("Isolate by host quantification fg target:ng DNA added") +
+  xlab("Host") + ylab("fg P. sansomeana / ng DNA added")
+
+fg_target_and_input_dna_ratio_isolate
+
+#ggsave("fg P. sansomeana per ng total DNA by isolate and host.png", plot=fg_target_and_input_dna_ratio_isolate, width = 16, height = 12, units = "in")
+
+```
+
+average quantification for each host species tested
+```{r, eval=FALSE}
+psanso_quantification_fg
+
+host_summary <- psanso_quantification_fg %>%
+  filter(Isolate %in% c('C-IASO2 6-15', 'C-KSSO2 3-6', 'C-NESO2 5-12', 'C-NESO2 5-19', 'C-NESO2 5-5', 'KSSO 6-1', 'MICO 3-15', 'MICO 3-24', 'MICO 3-28', 'MPS17_22', 'MPS17_24', 'ONSO2 1-114', 'V-KSSO2 1-7', 'V-KSSO2 3-6', 'V-NESO2 5-44', 'V-NESO2 5-45', 'VAL1602-18', 'VAL1602-84')) %>%
+  subset(., fgul_target_ngul_dnaadded_ratio != "NA") %>%
+                group_by(Host) %>%
+                summarize(mean_fgul_target_ngul_dnaadded_ratio = mean(fgul_target_ngul_dnaadded_ratio),
+                          sd_fgul_target_ngul_dnaadded_ratio=sd(fgul_target_ngul_dnaadded_ratio))
+
+isolate_summary <- psanso_quantification_fg %>%
+  filter(Isolate %in% c('C-IASO2 6-15', 'C-KSSO2 3-6', 'C-NESO2 5-12', 'C-NESO2 5-19', 'C-NESO2 5-5', 'KSSO 6-1', 'MICO 3-15', 'MICO 3-24', 'MICO 3-28', 'MPS17_22', 'MPS17_24', 'ONSO2 1-114', 'V-KSSO2 1-7', 'V-KSSO2 3-6', 'V-NESO2 5-44', 'V-NESO2 5-45', 'VAL1602-18', 'VAL1602-84')) %>%
+  subset(., fgul_target_ngul_dnaadded_ratio != "NA") %>%
+                group_by(Isolate, Host) %>%
+                summarize(mean_fgul_target_ngul_dnaadded_ratio = mean(fgul_target_ngul_dnaadded_ratio),
+                          sd_fgul_target_ngul_dnaadded_ratio=sd(fgul_target_ngul_dnaadded_ratio))
+
+
+#write.xlsx(host_summary, "mean fg P. sansomeana per ng dna added host summary.xlsx")
+
+#write.xlsx(isolate_summary, "mean fg P. sansomeana per ng dna added isolate summary.xlsx")
+
+```
+
+Average quantification by isolate for each host species tested
+```{r, eval=FALSE}
+
+isolate_summary <- psanso_quantification %>%
+  subset(., subset = Isolate %in% c('C-IASO2 6-15', 'C-KSSO2 3-6', 'C-NESO2 5-12', 'C-NESO2 5-19', 'C-NESO2 5-5', 'KSSO 6-1', 'MICO 3-15', 'MICO 3-24', 'MICO 3-28', 'MPS17_22', 'MPS17_24', 'ONSO2 1-114', 'V-KSSO2 1-7', 'V-KSSO2 3-6', 'V-NESO2 5-44', 'V-NESO2 5-45', 'VAL1602-18', 'VAL1602-84')) %>%
+  subset(., pgul_target_ngul_dnaadded_ratio != "NA") %>%
+  group_by(Isolate, Host) %>%
+                summarize(mean_pgul_target_ngul_dnaadded_ratio = mean(pgul_target_ngul_dnaadded_ratio))
+
+
+```
+
+
+EC50 data visualization
+```{r}
+psan_ec50_nctrl <- psan_ec50 %>%
+  subset(., !Isolate %in% c("ILSO_3-48C")) %>% # removing the Pythium irregulare control
+  subset(., !abs.EC50.estimate %in% c("NA")) %>% # removing NA values in the abs.EC50.estimate
+  subset(., !abs.EC50.estimate %in% c("16.566173060000001")) # removing this erronious data, 99.4-100% reduction in growth at 10ppm Ethaboxam via poison plate assay data.
+
+# should double check the Absolute ec50 values. Some are way off of what we would expect. For now, write up the results you do have done, then come back to ec50 determination
+
+ec50_plot <- ggplot(psan_ec50_nctrl, aes(x=chemistry, y=as.numeric(abs.EC50.estimate))) +
+geom_violin(scale="width", size=0.1, position = position_dodge(width = 1.0), trim=TRUE) + 
+  geom_point(position=position_jitter(seed = 1, width=0.2), alpha=0.5) + 
+  stat_summary(fun = "mean", geom="crossbar", width= 0.5, colour="black") +
+  #facet_wrap(vars(Host), scales = "free") +
+  scale_y_log10() +
+  theme_gray() +
+  theme(axis.text.x = element_text(size = 15, face = "bold", family = "serif", angle = 45, hjust = 1),
+                     axis.text.y = element_text(size = 15, face = "bold", family = "serif"),
+                     axis.title.x = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.title.y = element_text(size = 20, face = "bold", family = "serif"),
+                     axis.line.x = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     axis.line.y = element_line(colour = 'gray', size=0.5, linetype='solid'),
+                     legend.text = element_text(size = 15, face = "bold", family = "serif"),
+                     legend.key = element_blank(),
+                     legend.title = element_text(size = 15, face="bold", family = "serif"),
+                     legend.position = "right",
+                     strip.text.x = element_text(size = 20, face = "bold", family = "serif"),
+                     title = element_text(size = 25, family = "serif")) +
+                      #ylim(0,) +
+                      ggtitle(expression(Absolute~EC[50]~estimation)) +
+  xlab("Oomycide compound") +
+  ylab(expression(Absolute~EC[50]~(μg/mL)))
+  
+  
+ec50_plot
+
+ggsave("Figure 5 Absolute EC50 for each isolate and experimental run.png", plot=ec50_plot, width = 16, height = 12, units = "in")
+
+psan_ec50_nctrl
+
+
+
+fung_summary <- psan_ec50_nctrl %>%
+  group_by(chemistry) %>%
+  summarize(mean_abs_ec50=mean(as.numeric(abs.EC50.estimate, na.rm=TRUE)),
+            sd_abs_ec50=sd(abs.EC50.estimate, na.rm=TRUE),
+            mean_rel_ec50=mean(rel.EC50.estimate, na.rm=TRUE),
+            sd_rel_ec50=sd(rel.EC50.estimate, na.rm=TRUE),
+            ec50_min = min(abs.EC50.estimate),
+            ec50_max = max(abs.EC50.estimate))
+```
